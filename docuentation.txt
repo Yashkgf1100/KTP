@@ -1,0 +1,169 @@
+================================================================================
+                         MINI PROJECT 1 DOCUMENTATION
+                  KTP (KGP Transport Protocol) Socket Implementation
+                          CS39006: Networks Laboratory, Spring 2025-26
+================================================================================
+
+Group Details:
+Member 1 Name: Perumalla Srujan Shyam
+Member 1 Roll number: 23CS10053
+Member 2 Name: Rajaboina Naveen
+Member 2 Roll number: 23CS10058
+
+================================================================================
+SECTION 1: PERFORMANCE TABLE — Average Transmissions per Message vs. Drop Prob. (p)
+================================================================================
+
+The table below reports the experimental average number of transmissions made per 
+unique message for a fixed file transfer (size > 100 KB), using a retransmit timeout 
+(T) of 5 seconds and a window size of 10 slots. 
+
+Average transmissions = (Total transmissions made by thread S) / (Total unique 
+messages placed in the send buffer by the application via k_sendto).
+
++-------+-------------------+---------------------+-----------------------------+
+|   p   | Total Messages    | Total Transmissions | Avg Transmissions/Message   |
++-------+-------------------+---------------------+-----------------------------+
+| 0.05  |       221         |         294         |           1.3303            |
+| 0.10  |       221         |         319         |           1.4434            |
+| 0.15  |       221         |         383         |           1.7330            |
+| 0.20  |       221         |         390         |           1.7647            |
+| 0.25  |       221         |         430         |           1.9457            |
+| 0.30  |       221         |         480         |           2.1719            |
+| 0.35  |       221         |         522         |           2.3620            |
+| 0.40  |       221         |         567         |           2.5656            |
+| 0.45  |       221         |         755         |           3.4163            |
+| 0.50  |       221         |         822         |           3.7195            |
++-------+-------------------+---------------------+---------------------------+
+
+Observation: As the drop probability (p) increases, the average number of 
+transmissions per message grows non-linearly. Because we are using a Go-Back-N 
+style retransmission over a sliding window, a single dropped packet (or dropped ACK) 
+can force the sender to retransmit the entire unacknowledged window once the 5-second 
+timeout expires, leading to a steep increase in network traffic at higher drop rates.
+
+================================================================================
+SECTION 2: CORE DATA STRUCTURES
+================================================================================
+
+Our implementation relies on a shared memory segment to communicate between the 
+user-space library and the background initksocket daemon. 
+
+1. `window` (Sliding Window State)
+--------------------------------------------------------------------------------
+To keep our code DRY (Don't Repeat Yourself), we use a single `window` structure 
+to manage the sliding window logic for both the sender (`swnd`) and the receiver (`rwnd`).
+- `base`: A circular index pointing to the oldest outstanding slot in the buffer.
+- `size`: The number of currently usable window slots. For the receiver, this 
+  represents the available buffer space.
+- `next_seq` / `last_ack`: Tracks the sequence numbers we are assigning (sender) 
+  or the last strictly in-order sequence number we successfully acknowledged (receiver).
+- `seq`, `recvd`, `sent_at`: Arrays mapping each buffer slot to its sequence number, 
+  its receipt status, and the exact timestamp it was transmitted over the network.
+
+2. `k_sockinfo` (Shared Memory Socket Entry)
+--------------------------------------------------------------------------------
+This is the central state object. We allocate an array of MAX_KTP_SOCKETS (10) of 
+these in shared memory. Each one represents a single KTP connection.
+- `sockfd`: The underlying raw UDP file descriptor. Crucially, this is managed 
+  exclusively by Thread R in the daemon, not the user application.
+- `send_buff` & `recv_buff`: Ring buffers that store the actual 512-byte application 
+  payloads.
+- `bind_pending` & `is_bound`: Flags used to tell the daemon to execute an OS-level 
+  `bind()` on behalf of the user application.
+- `nospace` & `probe_needed`: Boolean flags used for flow control. If the receiver's 
+  buffer fills up, it alerts the sender. Once space frees up, these flags trigger 
+  a probe ACK to unblock the sender.
+- `is_closing`, `is_closed`, `fin_sent_at`: State trackers that manage our custom 
+  FIN/FAK graceful teardown handshake.
+
+3. `union semun`
+--------------------------------------------------------------------------------
+A standard C union required to safely execute System V semaphore operations 
+(specifically `semctl SETALL`) across different UNIX platforms.
+
+================================================================================
+SECTION 3: USER LIBRARY API (ksocket.c)
+================================================================================
+
+These functions allow the user application to interact with the KTP protocol 
+without ever making direct network system calls.
+
+- `k_socket()`: Locks the shared memory table using a semaphore, scans for an 
+  available `k_sockinfo` slot, initializes all window boundaries and buffers to 
+  zero, and returns the slot index as the KTP file descriptor.
+- `k_bind()`: Saves the local and remote IP/Port pairs into shared memory and sets 
+  the `bind_pending` flag. This signals the daemon to create and bind the actual 
+  UDP socket in the background.
+- `k_sendto()`: Locks the specific socket's semaphore, verifies the destination 
+  address, and drops the application's payload into the first free slot in the 
+  `send_buff`. It marks the slot as unsent, leaving the actual transmission to Thread S.
+- `k_recvfrom()`: Checks the `rwnd` to see if the next expected in-order message 
+  has arrived. If so, it copies the payload to the user, clears the buffer slot, 
+  and increments the available window size.
+- `k_close()`: Initiates a graceful teardown. Instead of abruptly destroying the 
+  shared memory, it sets `is_closing = true`, prompting the daemon to perform a 
+  FIN/FAK handshake with the peer to ensure all in-flight data settles.
+
+================================================================================
+SECTION 4: DAEMON PROCESS (initksocket.c)
+================================================================================
+
+The daemon acts as the engine of the KTP protocol, moving data from shared memory 
+out onto the actual network.
+
+- `dropMessage(float p)`: Simulates an unreliable communication channel by 
+  generating a random float and dropping incoming UDP packets if the value falls 
+  below our defined probability threshold `P`.
+
+- `threadR` (Receiver/Dispatcher): Runs a continuous `select()` event loop. 
+  It watches all bound UDP sockets. When a packet arrives (and survives the drop 
+  simulator), Thread R parses its KTP header. If it's a DATA packet, it buffers 
+  it and fires back an ACK. If it's an ACK, it slides the sender's window forward. 
+  It also handles timeouts, sending "probe ACKs" if a sender is stalled waiting 
+  for a window update.
+
+- `threadS` (Sender/Retransmitter): Wakes up periodically (every T/2 seconds). 
+  It scans the sender window (`swnd`). If it finds any messages that have been 
+  waiting longer than the T=5s timeout without an ACK, it retransmits them. It 
+  also handles transmitting brand new messages queued by the user, and manages 
+  sending FIN packets during the teardown phase.
+
+- `threadG` (Garbage Collector): A safety-net thread that sleeps and periodically 
+  checks the process IDs (PIDs) associated with active KTP sockets. If a user 
+  application crashes without calling `k_close()`, Thread G detects the dead PID 
+  and forcefully cleans up the shared memory to prevent resource leaks.
+
+================================================================================
+SECTION 5: KEY DESIGN DECISIONS
+================================================================================
+
+1. Semaphore-Based Synchronization
+Instead of using busy-waiting (spinning) loops which waste CPU cycles, this 
+implementation relies strictly on System V Semaphores. By using `sem_wait_slot` 
+and `sem_post_slot`, we ensure perfect mutual exclusion for each individual socket, 
+allowing multiple applications to use KTP concurrently without race conditions.
+
+2. Deferred UDP Binding
+UDP socket descriptors must reside within the daemon's process space to function 
+correctly with `select()`. Therefore, `k_bind` simply writes the desired addresses 
+to shared memory. Thread R reads these addresses and performs the OS-level `socket()` 
+and `bind()` calls during its event loop, seamlessly bridging user-space and the network.
+
+3. Event-Driven Probe ACKs for Flow Control
+If the receiver's application reads data slowly, the `recv_buff` fills up, the `rwnd` 
+shrinks to zero, and the sender stalls. To prevent a permanent deadlock, once the 
+user finally calls `k_recvfrom()` and frees a slot, the library flags `probe_needed`. 
+Thread R detects this on its next timeout and immediately fires a probe ACK to the 
+sender, reopening the window.
+
+4. Robust Teardown Handshake
+Abruptly closing a socket can result in truncated file transfers. Our `k_close()` 
+utilizes a structured FIN/FAK (Finish / Finish-Acknowledge) handshake handled by 
+Thread S. Thread S will aggressively retransmit the FIN packet up to `MAXFIN` 
+times if ACKs are dropped, ensuring both sides safely close the connection even 
+on highly unreliable simulated links.
+
+================================================================================
+END OF DOCUMENTATION
+================================================================================
